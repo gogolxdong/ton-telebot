@@ -1,2 +1,3 @@
 tontelebot
 .env
+*.sql
