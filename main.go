@@ -10,11 +10,15 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/wallet"
 	tele "gopkg.in/telebot.v3"
 
 	"time"
+
+	"github.com/xssnick/tonutils-go/address"
+	"github.com/xssnick/tonutils-go/ton/jetton"
 
 	_ "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
@@ -34,11 +38,11 @@ func walletMenu(user []model.User) *tele.ReplyMarkup {
 		},
 		{
 			Text: "购买Jetton",
-			Data: "buy_ton",
+			Data: "buy_token",
 		},
 		{
 			Text: "卖出Jetton",
-			Data: "sell_ton",
+			Data: "sell_token",
 		},
 	}
 	if len(user) == 0 {
@@ -78,6 +82,34 @@ func genModel(db *gorm.DB) {
 	g.Execute()
 
 }
+
+func initUser(c tele.Context, db *gorm.DB, client *liteclient.ConnectionPool, api ton.APIClientWrapped, user []model.User, walletClient *wallet.Wallet) {
+	adnlHost := os.Getenv("ADNLHOST")
+	adnlPort := os.Getenv("ADNLPORT")
+	adnlKey := os.Getenv("ADNLKEY")
+	u := c.Sender()
+	tx := db.Find(&user, "uid=?", u.ID)
+	if tx.Error != nil {
+		fmt.Println(tx.Error)
+		c.Send("欢迎使用TON钱包机器人！", walletMenu(nil))
+	}
+	client = liteclient.NewConnectionPool()
+
+	err := client.AddConnection(context.Background(), fmt.Sprintf("%s:%s", adnlHost, adnlPort), adnlKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	api = ton.NewAPIClient(client).WithRetry()
+	seed := strings.Split(user[0].Mnemonic, " ")
+	log.Println(seed)
+	w, err := wallet.FromSeed(api, seed, wallet.V4R2)
+	if err != nil {
+		log.Fatal(err)
+	}
+	walletClient = w
+}
+
 func main() {
 	err := godotenv.Load(".env")
 	if err != nil {
@@ -88,9 +120,7 @@ func main() {
 	dbUser := os.Getenv("DBUSER")
 	dbPassword := os.Getenv("DBPASSWORD")
 	dbname := os.Getenv("DBNAME")
-	adnlHost := os.Getenv("ADNLHOST")
-	adnlPort := os.Getenv("ADNLPORT")
-	adnlKey := os.Getenv("ADNLKEY")
+
 	pref := tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -122,26 +152,7 @@ func main() {
 	var api ton.APIClientWrapped
 	var snipeJetton string
 	b.Handle("/start", func(c tele.Context) error {
-		u := c.Sender()
-		tx := db.Find(&user, "uid=?", u.ID)
-		if tx.Error != nil {
-			fmt.Println(tx.Error)
-			return c.Send("欢迎使用TON钱包机器人！", walletMenu(nil))
-		}
-		client = liteclient.NewConnectionPool()
-
-		err := client.AddConnection(context.Background(), fmt.Sprintf("%s:%s", adnlHost, adnlPort), adnlKey)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		api = ton.NewAPIClient(client).WithRetry()
-		seed := strings.Split(user[0].Mnemonic, " ")
-		w, err := wallet.FromSeed(api, seed, wallet.V4R2)
-		if err != nil {
-			log.Fatal(err)
-		}
-		walletClient = w
+		initUser(c, db, client, api, user, walletClient)
 		return c.Send("欢迎使用TON钱包机器人！", walletMenu(user))
 
 	})
@@ -159,7 +170,7 @@ func main() {
 			walletClient = w
 			privateKey := base64.StdEncoding.EncodeToString(walletClient.PrivateKey())
 			tx := db.Save(&model.User{UID: u.ID, UserName: u.Username, JettonWalletAddress: w.Address().String(),
-				PrivateKey: privateKey, Mnemonic: strings.Join(seed, " "), CreateTime: time.Now()})
+				PrivateKey: privateKey, Mnemonic: strings.Join(seed, " "), CreateTime: time.Now(), UpdateTime: time.Now()})
 			if tx.Error != nil {
 				log.Fatal(tx.Error)
 			}
@@ -180,12 +191,91 @@ func main() {
 				return nil
 			})
 
-		} else if callBack == "buy_ton" {
-			c.Send(fmt.Sprintf("购买%s", snipeJetton))
+		} else if callBack == "buy_token" {
+			c.Send("请输入购买数量：")
+			var amount tlb.Coins
+			b.Handle(tele.OnText, func(c tele.Context) error {
+				var err error
+				amount = tlb.MustFromDecimal(c.Text(), 9)
 
-		} else if callBack == "sell_ton" {
-			c.Send(fmt.Sprintf("卖出%s", snipeJetton))
+				walletAddr := walletClient.Address()
+				snipeJettonAddress, err := address.ParseAddr(snipeJetton)
+				if err != nil {
+					log.Fatalf("ParseAddr: %s", err.Error())
+				}
+				token := jetton.NewJettonMasterClient(api, snipeJettonAddress)
 
+				ctx := client.StickyContext(context.Background())
+
+				tokenWallet, err := token.GetJettonWallet(ctx, walletAddr)
+				if err != nil {
+					log.Fatalf("GetJettonWallet: %s", err.Error())
+				}
+
+				tokenBalance, err := tokenWallet.GetBalance(ctx)
+				if err != nil {
+					log.Fatalf("GetBalance: %s", err.Error())
+				}
+				log.Println("our jetton balance:", tokenBalance.String())
+
+				to := address.MustParseAddr(user[0].JettonWalletAddress)
+				transferPayload, err := tokenWallet.BuildTransferPayloadV2(to, to, amount, tlb.ZeroCoins, nil, nil)
+				if err != nil {
+					log.Fatalf("BuildTransferPayloadV2:", err.Error())
+				}
+
+				msg := wallet.SimpleMessage(tokenWallet.Address(), tlb.MustFromTON("0.05"), transferPayload)
+
+				tx, _, err := walletClient.SendWaitTransaction(ctx, msg)
+				if err != nil {
+					log.Fatalf("SendWaitTransaction:", err.Error())
+				}
+				c.Send(fmt.Sprintf("交易发送：%s", base64.StdEncoding.EncodeToString(tx.Hash)))
+				return nil
+			})
+
+		} else if callBack == "sell_token" {
+			c.Send("请输入售出数量：")
+			var amount tlb.Coins
+			b.Handle(tele.OnText, func(c tele.Context) error {
+				var err error
+				amount = tlb.MustFromDecimal(c.Text(), 9)
+
+				walletAddr := walletClient.Address()
+				snipeJettonAddress, err := address.ParseAddr(snipeJetton)
+				if err != nil {
+					log.Fatalf("ParseAddr: %s", err.Error())
+				}
+				token := jetton.NewJettonMasterClient(api, snipeJettonAddress)
+
+				ctx := client.StickyContext(context.Background())
+
+				tokenWallet, err := token.GetJettonWallet(ctx, walletAddr)
+				if err != nil {
+					log.Fatalf("GetJettonWallet: %s", err.Error())
+				}
+
+				tokenBalance, err := tokenWallet.GetBalance(ctx)
+				if err != nil {
+					log.Fatalf("GetBalance: %s", err.Error())
+				}
+				log.Println("our jetton balance:", tokenBalance.String())
+
+				to := address.MustParseAddr(user[0].JettonWalletAddress)
+				transferPayload, err := tokenWallet.BuildTransferPayloadV2(to, to, amount, tlb.ZeroCoins, nil, nil)
+				if err != nil {
+					log.Fatalf("BuildTransferPayloadV2:%s", err.Error())
+				}
+
+				msg := wallet.SimpleMessage(tokenWallet.Address(), tlb.MustFromTON("0.05"), transferPayload)
+
+				tx, _, err := walletClient.SendWaitTransaction(ctx, msg)
+				if err != nil {
+					log.Fatalf("SendWaitTransaction:%s", err.Error())
+				}
+				c.Send(fmt.Sprintf("交易发送：%s", base64.StdEncoding.EncodeToString(tx.Hash)))
+				return nil
+			})
 		}
 		return nil
 	})
