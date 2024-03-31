@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/wallet"
+	"github.com/xssnick/tonutils-go/tvm/cell"
 	tele "gopkg.in/telebot.v3"
 
 	"time"
@@ -83,46 +85,55 @@ func genModel(db *gorm.DB) {
 
 }
 
-func initUser(c tele.Context, db *gorm.DB, client *liteclient.ConnectionPool, api ton.APIClientWrapped, user []model.User, walletClient *wallet.Wallet) {
+func initUser(c tele.Context, db *gorm.DB) {
 	adnlHost := os.Getenv("ADNLHOST")
 	adnlPort := os.Getenv("ADNLPORT")
 	adnlKey := os.Getenv("ADNLKEY")
 	u := c.Sender()
 	tx := db.Find(&user, "uid=?", u.ID)
 	if tx.Error != nil {
-		fmt.Println(tx.Error)
+		fmt.Println("Find", tx.Error)
 		c.Send("欢迎使用TON钱包机器人！", walletMenu(nil))
 	}
-	client = liteclient.NewConnectionPool()
-
+	fmt.Println(adnlHost, adnlPort, adnlKey)
 	err := client.AddConnection(context.Background(), fmt.Sprintf("%s:%s", adnlHost, adnlPort), adnlKey)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("AddConnection: %s", err.Error())
 	}
 
-	api = ton.NewAPIClient(client).WithRetry()
 	seed := strings.Split(user[0].Mnemonic, " ")
-	log.Println(seed)
 	w, err := wallet.FromSeed(api, seed, wallet.V4R2)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("FromSeed: %s", err.Error())
 	}
 	walletClient = w
+	fmt.Println("walletClient:", walletClient)
 }
+
+var client *liteclient.ConnectionPool = liteclient.NewConnectionPool()
+var api ton.APIClientWrapped = ton.NewAPIClient(client).WithRetry()
+var stonRouter *address.Address = address.MustParseAddr("EQARULUYsmJq1RiZ-YiH-IJLcAZUVkVff-KBPwEmmaQGH6aC")
+
+var walletClient *wallet.Wallet
+var user []model.User
+
+var snipeJetton string
+var botToken string
+var dbUser string
+var dbPassword string
+var dbname string
 
 func main() {
 	err := godotenv.Load(".env")
 	if err != nil {
 		log.Fatalf("Error loading .env file: %s", err)
 	}
-
-	token := os.Getenv("TOKEN")
-	dbUser := os.Getenv("DBUSER")
-	dbPassword := os.Getenv("DBPASSWORD")
-	dbname := os.Getenv("DBNAME")
-
+	botToken = os.Getenv("TOKEN")
+	dbUser = os.Getenv("DBUSER")
+	dbPassword = os.Getenv("DBPASSWORD")
+	dbname = os.Getenv("DBNAME")
 	pref := tele.Settings{
-		Token:  token,
+		Token:  botToken,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 	}
 
@@ -138,21 +149,13 @@ func main() {
 	}
 	// genModel(db)
 
-	sqlDB, err := db.DB()
+	// sqlDB, err := db.DB()
+	// sqlDB.SetMaxIdleConns(10)
+	// sqlDB.SetMaxOpenConns(100)
+	// sqlDB.SetConnMaxLifetime(time.Hour)
 
-	sqlDB.SetMaxIdleConns(10)
-
-	sqlDB.SetMaxOpenConns(100)
-
-	sqlDB.SetConnMaxLifetime(time.Hour)
-
-	var walletClient *wallet.Wallet
-	var user []model.User
-	var client *liteclient.ConnectionPool
-	var api ton.APIClientWrapped
-	var snipeJetton string
 	b.Handle("/start", func(c tele.Context) error {
-		initUser(c, db, client, api, user, walletClient)
+		initUser(c, db)
 		return c.Send("欢迎使用TON钱包机器人！", walletMenu(user))
 
 	})
@@ -184,7 +187,6 @@ func main() {
 
 		} else if callBack == "snipe_token" {
 			c.Send("请输入合约地址：")
-
 			b.Handle(tele.OnText, func(c tele.Context) error {
 				snipeJetton = c.Text()
 				c.Send(fmt.Sprintf("你输入的合约地址是：%s", snipeJetton))
@@ -197,14 +199,14 @@ func main() {
 			b.Handle(tele.OnText, func(c tele.Context) error {
 				var err error
 				amount = tlb.MustFromDecimal(c.Text(), 9)
-
+				log.Printf("walletClient: %v", walletClient)
 				walletAddr := walletClient.Address()
 				snipeJettonAddress, err := address.ParseAddr(snipeJetton)
 				if err != nil {
 					log.Fatalf("ParseAddr: %s", err.Error())
 				}
 				token := jetton.NewJettonMasterClient(api, snipeJettonAddress)
-
+				fmt.Println(client)
 				ctx := client.StickyContext(context.Background())
 
 				tokenWallet, err := token.GetJettonWallet(ctx, walletAddr)
@@ -221,14 +223,14 @@ func main() {
 				to := address.MustParseAddr(user[0].JettonWalletAddress)
 				transferPayload, err := tokenWallet.BuildTransferPayloadV2(to, to, amount, tlb.ZeroCoins, nil, nil)
 				if err != nil {
-					log.Fatalf("BuildTransferPayloadV2:", err.Error())
+					log.Fatalf("BuildTransferPayloadV2: %s", err.Error())
 				}
 
 				msg := wallet.SimpleMessage(tokenWallet.Address(), tlb.MustFromTON("0.05"), transferPayload)
 
 				tx, _, err := walletClient.SendWaitTransaction(ctx, msg)
 				if err != nil {
-					log.Fatalf("SendWaitTransaction:", err.Error())
+					log.Fatalf("SendWaitTransaction: %s", err.Error())
 				}
 				c.Send(fmt.Sprintf("交易发送：%s", base64.StdEncoding.EncodeToString(tx.Hash)))
 				return nil
@@ -236,10 +238,10 @@ func main() {
 
 		} else if callBack == "sell_token" {
 			c.Send("请输入售出数量：")
-			var amount tlb.Coins
+			// var amount tlb.Coins
 			b.Handle(tele.OnText, func(c tele.Context) error {
 				var err error
-				amount = tlb.MustFromDecimal(c.Text(), 9)
+				// amount = tlb.MustFromDecimal(c.Text(), 9)
 
 				walletAddr := walletClient.Address()
 				snipeJettonAddress, err := address.ParseAddr(snipeJetton)
@@ -260,16 +262,49 @@ func main() {
 					log.Fatalf("GetBalance: %s", err.Error())
 				}
 				log.Println("our jetton balance:", tokenBalance.String())
+				body := cell.BeginCell().
+					MustStoreUInt(0x25938561, 32).    // swap op code
+					MustStoreUInt(rand.Uint64(), 64). // query id
+					MustStoreAddr(stonRouter).
+					MustStoreRef(
+						cell.BeginCell().
+							MustStoreBigCoins(tlb.MustFromTON("1.521").Nano()).
+							EndCell(),
+					).EndCell()
 
-				to := address.MustParseAddr(user[0].JettonWalletAddress)
-				transferPayload, err := tokenWallet.BuildTransferPayloadV2(to, to, amount, tlb.ZeroCoins, nil, nil)
+				message := &wallet.Message{
+					Mode: 1,
+					InternalMessage: &tlb.InternalMessage{
+						Bounce:  true,
+						DstAddr: stonRouter,
+						Amount:  tlb.MustFromTON("0.03"),
+						Body:    body,
+					},
+				}
+				block, err := api.CurrentMasterchainInfo(context.Background())
 				if err != nil {
-					log.Fatalf("BuildTransferPayloadV2:%s", err.Error())
+					panic(err)
 				}
 
-				msg := wallet.SimpleMessage(tokenWallet.Address(), tlb.MustFromTON("0.05"), transferPayload)
+				response, err := api.RunGetMethod(
+					context.Background(),
+					block,
+					stonRouter,
+					"get_pool_address",
+					map[string]*address.Address{
+						"token0": address.MustParseAddr("EQA2kCVNwVsil2EM2mB0SkXytxCqQjS4mttjDpnXmwG9T6bO"),
+						"token1": address.MustParseAddr("EQA2kCVNwVsil2EM2mB0SkXytxCqQjS4mttjDpnXmwG9T6bO"),
+					},
+				)
+				poolAddress := response.MustCell(0).BeginParse().MustLoadAddr()
 
-				tx, _, err := walletClient.SendWaitTransaction(ctx, msg)
+				if err != nil {
+					panic(fmt.Errorf("failed to get pool address: %w", err))
+				}
+
+				fmt.Printf("Pool Address: %s\n", poolAddress)
+
+				tx, _, err := walletClient.SendWaitTransaction(ctx, message)
 				if err != nil {
 					log.Fatalf("SendWaitTransaction:%s", err.Error())
 				}

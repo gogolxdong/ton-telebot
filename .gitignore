@@ -1,3 +1,5 @@
 tontelebot
 .env
 *.sql
+main
+blockScan
